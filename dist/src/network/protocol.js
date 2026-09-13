@@ -1,6 +1,6 @@
 import { B, H } from '../blocks.js';
 import { normalizeOptions, seedNumber } from '../world-options.js';
-export const GAME_VERSION = '1.8.0',
+export const GAME_VERSION = '1.8.2',
   PROTOCOL = 2,
   MAX_PLAYERS = 4,
   MAX_EDITS = 200000;

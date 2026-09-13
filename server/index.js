@@ -41,7 +41,15 @@ const actions = new Set([
 /** Relay authority: only the room host may publish world edits, simulation
  * snapshots and combat results. Guests submit intents and their own movement.
  * This is a trusted-friends listen server, not a competitive anti-cheat server. */
-export function createGameServer({ root = ROOT, maxRooms = 8, allowedOrigins = [], tls } = {}) {
+export function createGameServer({
+  root = ROOT,
+  maxRooms = 8,
+  allowedOrigins = [],
+  tls,
+  heartbeatMs = 10000,
+  idleTimeoutMs = 90000,
+  logger = console,
+} = {}) {
   const rooms = new Map();
   const serve = async (req, res) => {
     try {
@@ -114,7 +122,7 @@ export function createGameServer({ root = ROOT, maxRooms = 8, allowedOrigins = [
       players: roster(p.room),
       frame: p.room.frame,
     });
-  function leave(p) {
+  function leave(p, reason = 'Host left. The mirrored world is now solo.') {
     const r = p.room;
     if (!r) return;
     p.room = null;
@@ -123,7 +131,7 @@ export function createGameServer({ root = ROOT, maxRooms = 8, allowedOrigins = [
       rooms.delete(r.id);
       for (const guest of r.peers.values()) {
         guest.room = null;
-        send(guest.ws, { type: 'closed', reason: 'Host left. The mirrored world is now solo.' });
+        send(guest.ws, { type: 'closed', reason });
       }
       r.peers.clear();
     } else broadcast(r, { type: 'players', players: roster(r) });
@@ -154,17 +162,23 @@ export function createGameServer({ root = ROOT, maxRooms = 8, allowedOrigins = [
       state: null,
       count: 0,
       window: Date.now(),
-      alive: true,
+      lastSeen: Date.now(),
+      lastWarning: 0,
     };
     const handshake = setTimeout(() => {
       if (!p.room) ws.close(1008, 'Create or join a room.');
     }, 30000);
     handshake.unref();
-    ws.on('pong', () => (p.alive = true));
-    ws.on('error', () => {});
-    ws.on('close', () => {
+    ws.on('pong', () => (p.lastSeen = Date.now()));
+    ws.on('error', (error) =>
+      logger.warn(`[multiplayer] ${p.id.slice(-6)} socket error: ${error.message}`),
+    );
+    ws.on('close', (code, rawReason) => {
       clearTimeout(handshake);
-      leave(p);
+      clearTimeout(p.closeTimer);
+      const reason = p.closeReason || rawReason.toString() || 'No close reason received';
+      logger.warn(`[multiplayer] ${p.id.slice(-6)} disconnected (${code}): ${reason}`);
+      leave(p, `Host disconnected (${code}): ${reason}. The mirrored world is now solo.`);
     });
     ws.on('message', (raw, binary) => {
       try {
@@ -179,6 +193,8 @@ export function createGameServer({ root = ROOT, maxRooms = 8, allowedOrigins = [
         }
         const m = JSON.parse(raw.toString());
         if (!m || typeof m.type !== 'string') throw Error('Invalid message.');
+        // Application traffic also proves liveness if a proxy delays control pongs.
+        p.lastSeen = Date.now();
         if (m.type === 'create' || m.type === 'join') {
           if (p.room) throw Error('Leave the current room first.');
           if (m.version !== GAME_VERSION || m.protocol !== PROTOCOL)
@@ -269,7 +285,10 @@ export function createGameServer({ root = ROOT, maxRooms = 8, allowedOrigins = [
               fatal: true,
               message: 'Room edit limit reached. Continuing in solo.',
             });
-            leave(p);
+            leave(
+              p,
+              'Room edit limit reached (200,000 cells). The mirrored world is now solo.',
+            );
             return;
           }
           for (const e of m.edits) r.edits.set(editKey(e), e);
@@ -307,7 +326,11 @@ export function createGameServer({ root = ROOT, maxRooms = 8, allowedOrigins = [
         if (m.type === 'blast') {
           if (!point(m.position) || !Number.isFinite(m.power) || m.power < 2 || m.power > 8)
             throw Error('Invalid blast.');
-          broadcast(r, { type: 'blast', epoch: m.epoch, position: m.position, power: m.power }, p);
+          broadcast(
+            r,
+            { type: 'blast', epoch: m.epoch, position: m.position, power: m.power },
+            p,
+          );
           return;
         }
         if (m.type === 'damage') {
@@ -320,17 +343,28 @@ export function createGameServer({ root = ROOT, maxRooms = 8, allowedOrigins = [
             throw Error('Invalid damage.');
           const victim = r.peers.get(m.id);
           if (victim)
-            send(victim.ws, { type: 'damage', life: m.life, amount: m.amount, dx: m.dx, dz: m.dz });
+            send(victim.ws, {
+              type: 'damage',
+              life: m.life,
+              amount: m.amount,
+              dx: m.dx,
+              dz: m.dz,
+            });
           return;
         }
         if (m.type === 'notice') {
           const victim = r.peers.get(m.id);
-          if (victim) send(victim.ws, { type: 'notice', message: String(m.message).slice(0, 180) });
+          if (victim)
+            send(victim.ws, { type: 'notice', message: String(m.message).slice(0, 180) });
           return;
         }
         throw Error('Unknown message.');
       } catch (e) {
         send(ws, { type: 'error', message: e.message || 'Invalid packet.' });
+        if (Date.now() - p.lastWarning > 5000) {
+          logger.warn(`[multiplayer] ${p.id.slice(-6)} rejected update: ${e.message}`);
+          p.lastWarning = Date.now();
+        }
       }
     });
     ws._peer = p;
@@ -338,14 +372,17 @@ export function createGameServer({ root = ROOT, maxRooms = 8, allowedOrigins = [
   const heartbeat = setInterval(() => {
     for (const ws of wss.clients) {
       const p = ws._peer;
-      if (!p.alive) {
-        ws.terminate();
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      if (Date.now() - p.lastSeen >= idleTimeoutMs) {
+        p.closeReason = 'Heartbeat timed out: no traffic from client';
+        ws.close(4000, p.closeReason);
+        p.closeTimer = setTimeout(() => ws.terminate(), 5000);
+        p.closeTimer.unref();
         continue;
       }
-      p.alive = false;
       ws.ping();
     }
-  }, 30000);
+  }, heartbeatMs);
   heartbeat.unref();
   return {
     server,

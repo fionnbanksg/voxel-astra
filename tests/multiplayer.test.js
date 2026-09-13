@@ -442,3 +442,209 @@ test('multiplayer sends held items and swings, deduplicates deaths, and restores
   await until(() => guest.net.ragdolls.pool.filter((r) => r.active).length === 2, tick);
   assert.ok(guest.net.ragdolls.pool.some((r) => r.active && r.kind === 'rival'));
 });
+
+test('heartbeat accepts active clients without control pongs and reports genuinely idle clients', async (t) => {
+  const logs = [];
+  const app = await server(t, {
+    heartbeatMs: 40,
+    idleTimeoutMs: 220,
+    logger: { warn: (m) => logs.push(m) },
+  });
+  const active = new WebSocket(endpoint(app.url), { autoPong: false });
+  const idle = new WebSocket(endpoint(app.url), { autoPong: false });
+  await Promise.all([once(active, 'open'), once(idle, 'open')]);
+  const messages = [];
+  active.on('message', (raw) => messages.push(JSON.parse(raw)));
+  active.send(JSON.stringify({ ...hello, type: 'create', world, edits: [] }));
+  await until(() => messages.some((m) => m.type === 'welcome'));
+  const pump = setInterval(() => active.send(JSON.stringify({ type: 'ping', sent: 1 })), 40);
+  t.after(() => clearInterval(pump));
+  const [code, reason] = await once(idle, 'close');
+  assert.equal(code, 4000);
+  assert.match(reason.toString(), /Heartbeat timed out/);
+  await delay(300);
+  assert.equal(active.readyState, WebSocket.OPEN);
+  assert.ok(messages.filter((m) => m.type === 'pong').length > 5);
+  assert.ok(logs.some((m) => /Heartbeat timed out/.test(m)));
+  clearInterval(pump);
+});
+
+test('congested uploads retain terrain and explosions, then drain in bounded batches', () => {
+  globalThis.WebSocket = WebSocket;
+  const host = rig();
+  host.net.role = 'host';
+  const sent = [];
+  host.net.socket = {
+    readyState: WebSocket.OPEN,
+    bufferedAmount: 300000,
+    send: (raw) => sent.push(JSON.parse(raw)),
+    close() {},
+  };
+  for (let x = 0; x < 5000; x++) host.w.set(x, 1, 0, B.STONE, false, true);
+  host.net.effects.push({ type: 'blast', position: world.spawn, power: 4 });
+  host.net.update(0.06, { ready: true, paused: false, time: 1 });
+  assert.equal(host.net.pending.size, 5000);
+  assert.equal(host.net.effects.length, 1);
+  assert.equal(host.net.host, true);
+  host.net.socket.bufferedAmount = 0;
+  for (let i = 0; i < 3; i++) host.net.update(0.06, { ready: true, paused: false, time: 1 });
+  assert.deepEqual(
+    sent.filter((m) => m.type === 'edits').map((m) => m.edits.length),
+    [2048, 2048, 904],
+  );
+  assert.equal(sent.filter((m) => m.type === 'blast').length, 1);
+  assert.equal(host.net.pending.size, 0);
+  assert.equal(host.net.effects.length, 0);
+  host.net.disconnect();
+  assert.equal(host.net.simulates(true, true), false, 'solo menus still pause');
+});
+
+test(
+  '65-second session survives heartbeat boundaries, TNT chains, host menus and host death',
+  { timeout: 75000 },
+  async (t) => {
+    const app = await server(t, { logger: { warn() {} } });
+    globalThis.location = { href: app.url, protocol: 'http:' };
+    globalThis.WebSocket = WebSocket;
+    const host = rig(),
+      guest = rig();
+    t.after(() => {
+      host.net.disconnect();
+      guest.net.disconnect();
+    });
+    host.net.connect(app.url, 'Host');
+    await until(() => host.net.host);
+    guest.net.connect(app.url, 'Guest', host.net.room);
+    await until(() => guest.net.guest);
+    host.player.setMode('creative');
+    guest.player.setMode('creative');
+    let observedBlasts = 0,
+      pausedFrame = false;
+    const visual = guest.tnt.visualBlast.bind(guest.tnt);
+    guest.tnt.visualBlast = (...args) => {
+      observedBlasts++;
+      return visual(...args);
+    };
+    const receive = guest.net.receive.bind(guest.net);
+    guest.net.receive = (m) => {
+      if (m.type === 'frame' && m.paused) pausedFrame = true;
+      receive(m);
+    };
+    const start = Date.now();
+    let planted = false,
+      killed = false;
+    while (Date.now() - start < 65000) {
+      const elapsed = (Date.now() - start) / 1000;
+      const paused = elapsed > 20;
+      if (!planted && elapsed > 24) {
+        planted = true;
+        // Dense terrain, 32 TNT charges and flowing water produce real edit bursts.
+        for (let x = 0; x < 20; x++)
+          for (let z = 0; z < 20; z++)
+            for (let y = 1; y < 4; y++) host.w.set(x, y, z, B.STONE, false, true);
+        host.w.set(22, 4, 0, B.WATER, false, true);
+        for (let i = 0; i < 32; i++) {
+          const x = (i % 8) * 2,
+            z = Math.floor(i / 8) * 3;
+          host.w.set(x, 4, z, B.TNT, false, true);
+          host.tnt.prime(x, 4, z, 1 + i * 0.02);
+        }
+      }
+      if (!killed && elapsed > 40) {
+        killed = true;
+        host.player.health = 0;
+        host.player.onDeath(host.player, 1, 0);
+        host.w.set(25, 1, 0, B.TNT, false, true);
+        host.tnt.prime(25, 1, 0, 1);
+      }
+      assert.equal(host.net.host, true, host.notices.join('\n'));
+      assert.equal(guest.net.guest, true, guest.notices.join('\n'));
+      if (host.net.simulates(true, paused)) {
+        host.tnt.tick(0.05);
+        host.fluids.tick(0.05);
+        host.tnt.flush();
+      }
+      host.net.update(0.05, { ready: true, paused, time: elapsed });
+      guest.net.update(0.05, { ready: true, paused: false, time: elapsed });
+      await delay(50);
+    }
+    await until(
+      () => !host.net.pending.size,
+      () => host.net.update(0.05, { ready: true, paused: true, time: 65 }),
+    );
+    await delay(100);
+    assert.ok(observedBlasts >= 33, `Guest observed ${observedBlasts} blasts`);
+    assert.equal(pausedFrame, false, 'host menus and death did not freeze shared simulation');
+    assert.equal(
+      guest.tnt.pool.some((b) => b.active),
+      false,
+    );
+    const sortEdits = (w) =>
+      worldEdits(w).sort((a, b) => a.join(',').localeCompare(b.join(',')));
+    assert.deepEqual(sortEdits(guest.w), sortEdits(host.w));
+    assert.equal(
+      host.notices.some((m) => /disconnect|failed|limit|Invalid/i.test(m)),
+      false,
+      host.notices.join('\n'),
+    );
+  },
+);
+
+test('disconnect reason stays visible after the connection closes', async (t) => {
+  const logs = [];
+  const app = await server(t, { logger: { warn: (m) => logs.push(m) } });
+  globalThis.location = { href: app.url, protocol: 'http:' };
+  globalThis.WebSocket = WebSocket;
+  const host = rig();
+  t.after(() => host.net.disconnect());
+  host.net.connect(app.url, 'Host');
+  await until(() => host.net.host);
+  [...app.wss.clients][0].close(1008, 'Message rate exceeded');
+  await until(() => !host.net.connected);
+  assert.match(host.net.lastError, /1008.*Message rate exceeded/);
+  assert.ok(host.notices.some((m) => /Message rate exceeded/.test(m)));
+});
+
+test('render interpolation moves body/head/items together and restores the latest combat pose', () => {
+  const host = rig();
+  host.net.role = 'host';
+  host.net.id = 'host';
+  const first = { ...state, heldBlock: B.TNT, life: 0 };
+  const latest = {
+    ...first,
+    position: { ...state.position, x: 2.5 },
+    yaw: Math.PI / 2,
+    pitch: 0.8,
+  };
+  host.net.roster([{ id: 'friend', name: 'Friend', state: first }]);
+  host.net.playerPose('friend', latest);
+  const p = host.net.players.get('friend'),
+    e = p.actor;
+  p.motion.reset();
+  p.motion.push(first, 0);
+  p.motion.push(latest, 50);
+  const render = host.net.remote.draw.bind(host.net.remote);
+  let sampled;
+  host.net.remote.draw = (...args) => {
+    sampled = { x: e.position.x, yaw: e.yaw, heading: e.heading, pitch: e.pitch };
+    render(...args);
+  };
+  host.net.drawPlayers(1, 125);
+  assert.equal(sampled.x, 1.5);
+  assert.equal(sampled.yaw, Math.PI / 4);
+  assert.equal(sampled.heading, Math.PI * 1.25);
+  assert.equal(sampled.pitch, 0.4);
+  assert.equal(e.yaw, latest.yaw);
+  assert.equal(e.heading, latest.yaw + Math.PI);
+  assert.equal(e.pitch, latest.pitch);
+  assert.deepEqual(e.position, latest.position);
+  assert.ok(host.net.remote.heldItems.pool.some((m) => m.visible));
+  // The restore also runs if the renderer fails.
+  host.net.remote.draw = () => {
+    throw Error('render failed');
+  };
+  assert.throws(() => host.net.drawPlayers(1, 125), /render failed/);
+  assert.deepEqual(e.position, latest.position);
+  assert.equal(e.yaw, latest.yaw);
+  host.net.disconnect();
+});

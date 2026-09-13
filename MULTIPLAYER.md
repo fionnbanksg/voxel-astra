@@ -2,15 +2,15 @@
 
 Multiplayer is an optional extension to this same game. You can play solo, host your current world, or join a friend. There is no second game build. Up to four people share a room.
 
-## Updating an existing copy to 1.8
+## Updating an existing copy to 1.8.2
 
 1. Stop the old Node server with Ctrl+C. Existing rooms are session-only and will close.
 2. Extract the new full source ZIP. Replace the contents of `dist/`, `server/`, and `tests/`, plus the root `package.json`, `package-lock.json`, README and this guide. Keep your own repository's `.git` directory and any hosting configuration you manage separately; the ZIP contains no Git history or credentials.
-3. In your project folder, run `npm ci`, then `npm run server`. The terminal should report **Voxel Wilds 1.8.0**.
+3. In your project folder, run `npm ci`, then `npm run server`. The terminal should report **Voxel Wilds 1.8.2**.
 4. If cloudflared is still running against port 8080, it can keep using the same tunnel. If you restart it, use the new printed address.
-5. Everyone refreshes the game (on Mac: Cmd+Shift+R). Create a new room and copy a fresh invite.
+5. Everyone refreshes the game (Windows: Ctrl+Shift+R; Mac: Cmd+Shift+R). Create a new room and copy a fresh invite.
 
-Both frontend and server must be updated together: this release uses **protocol 2** for held items, action poses, ragdoll snapshots and respawn life counters. Old 1.7 clients are rejected with a version message. Solo's original Python launch remains available. Commit the replacement project files to your own Git repository as usual; do not commit `node_modules`.
+Both frontend and server must be updated together: this release uses **protocol 2** for held items, action poses, ragdoll snapshots and respawn life counters. Older clients are rejected with a version message. Solo's original Python launch remains available. Commit the replacement project files to your own Git repository as usual; do not commit `node_modules`.
 
 ## Start the server
 
@@ -87,7 +87,7 @@ python3 -m http.server 8080 --directory dist
 | Regeneration | Host changes seed/options and replaces the party's world |
 | Personal controls | Each player keeps their own movement, creative mode, flight handling, view distance, hotbar and sound |
 
-Host menus/death pause creatures, fluids and TNT. Ragdolls continue while the host watches their own death view. Guests can still move and submit build actions, but creatures, fluids and TNT fuses wait for the host to resume. Background tabs can throttle the host; keep the game visible. Human players do not physically push each other's bodies. Held-torch lighting is personal; placed torches are shared voxel edits.
+Host menus and death no longer pause the shared world: creatures, fluids, TNT and ragdolls continue. Solo menus still pause. The host's own movement and controls stop while a menu is open. Background tabs can throttle the host; keep the game visible. Human players do not physically push each other's bodies. Held-torch lighting is personal; placed torches are shared voxel edits.
 
 ## Running on your own permanent server
 
@@ -123,7 +123,7 @@ Environment variables are read from the process. `.env` files are not automatica
 
 This is a **host-browser-authoritative listen server for trusted friends**. Node enforces room membership, host-only world state, message bounds and edit ordering. It relays guest intents to the host, which runs the existing gameplay systems. Positions, movement and environmental damage remain client-authoritative. This preserves responsive local controls and reuses the current game; it is not competitive anti-cheat or a fully authoritative dedicated game server.
 
-`dist/src/network/protocol.js` defines the versioned wire format. `multiplayer.js` wraps edit/TNT entry points only when connected. Browsers use native WebSocket; Node uses the pinned [`ws` package](https://github.com/websockets/ws). Player poses send at 20 Hz, mob/TNT snapshots at 10 Hz, and remote models interpolate between snapshots. Block batches have monotonic sequence numbers and world epochs; late joins replay canonical edits, including changes received while chunk workers are generating. Gaps trigger a disconnect rather than silently accepting a divergent world.
+`dist/src/network/protocol.js` defines the versioned wire format. `multiplayer.js` wraps edit/TNT entry points only when connected. Browsers use native WebSocket; Node uses the pinned [`ws` package](https://github.com/websockets/ws). Player poses send at 20 Hz and mob/TNT snapshots at 10 Hz. Remote player position, body yaw, head pitch, held items and name labels use a common 100 ms visual snapshot buffer. Yaw follows the shortest arc across the angle seam. Sixteen pooled snapshots per player cover uneven arrivals; a network stall holds the newest pose instead of predicting motion. Respawns, dimension changes, jumps greater than eight blocks and gaps longer than 500 ms reset interpolation. Local mouse input and authoritative combat/reach checks retain the latest pose. Mob/TNT interpolation is unchanged. Block batches have monotonic sequence numbers and world epochs; late joins replay canonical edits, including changes received while chunk workers are generating. Gaps trigger a disconnect rather than silently accepting a divergent world.
 
 Explicit bounds: **4 players per room, 8 rooms per relay, 200,000 distinct edited cells per room across both dimensions**, 28 mobs, 64 primed TNT entities and 16 ragdolls lasting nine seconds. Heavy fluids and explosions consume edit history too. Crossing the edit cap closes the room and leaves clients in solo; a fresh/regenerated world can host again. Host simulation loads an extra 5 × 5 chunk neighborhood around each guest; shared effects farther away wait until the host has that area loaded.
 
@@ -134,8 +134,16 @@ There is no persistent room storage, account system, host migration, automatic r
 - **Cannot reach server:** check `npm run server` is running and visit its `/health` URL. The Python static server alone does not provide multiplayer.
 - **Room not found:** host disconnected, server restarted, or code is wrong. Ask for a fresh invite.
 - **Game/server versions differ:** extract the latest source, run `npm ci`, restart Node and reload both clients.
-- **Edits do not appear:** check the connection/HOST status. Guest edits wait for host acceptance and loaded terrain. The host's pause state is shown in the guest HUD.
+- **Edits do not appear:** check the connection/HOST status. Guest edits wait for host acceptance and loaded terrain. Keep the host game visible; browser background throttling can delay shared simulation.
 - **Internet invite says localhost:** use the tunnel/public address in the Server address field before hosting, or replace only the invite's origin with the reachable server origin, preserving `#room=…`.
 - **Origin denied:** if you set `ALLOWED_ORIGINS`, include the actual game page origin. Leave it unset for the basic LAN/tunnel setup.
 
-Run `npm test` for all 63 tests, or `npm run test:multiplayer` for the socket/client suite. Tests cover real localhost sockets, room isolation, late-join edits, host-only authority, malformed input, limits, game-client mining/placing, fluids, PvP, creative immunity, TNT replication, epoch resets and solo fallback. Real worker tests cover in-flight edits. An interactive two-browser session, public tunnel connection and multiplayer frame-rate benchmark have not been verified in this environment.
+Run `npm test` for all 71 tests, or `npm run test:multiplayer` for the socket/client suite. Tests cover real localhost sockets, room isolation, late-join edits, host-only authority, malformed input, limits, game-client mining/placing, fluids, PvP, creative immunity, TNT replication, epoch resets and solo fallback. Real worker tests cover in-flight edits. A 65-second localhost session exercises both former 30-second heartbeat boundaries, 33 TNT explosions, host menus/death and final terrain equality. Additional tests check missing control pongs with live application traffic, idle cleanup, bounded upload batches and visible close reasons. Interpolation tests cover 20 Hz snapshots displayed at 30/60/144 Hz, angle wrapping, irregular arrivals, history bounds, respawns/teleports and restoration of the combat pose after rendering. An interactive two-browser session, public tunnel connection and multiplayer frame-rate benchmark have not been verified in this environment.
+
+## Connection diagnostics (1.8.1)
+
+The multiplayer panel retains the last disconnect code and reason, and the browser console logs it with `[Voxel multiplayer]`. The Node terminal reports socket closes and rejected packets without printing room invites. If a disconnect recurs, copy that line from the host and guest, plus the Node/cloudflared terminals. Code 1006 means the connection ended without a WebSocket close reason; it does not identify which network component failed.
+
+The relay pings every 10 seconds and accepts either a control pong or incoming application traffic as proof of liveness. It closes after 90 seconds without either. Terrain uploads send at most one 2,048-cell batch each 50 ms; unsent edits and explosions stay queued under temporary upload congestion. Latest pose/simulation snapshots are deferred instead of building up stale frames. The 200,000-cell room history cap remains in place and now tells guests why the room ended.
+
+This patch fixes a confirmed host-pause/TNT freeze and improves connection handling. The specific reported public-tunnel disconnect has not been reproduced locally; this is not a claim that Cloudflare was at fault or that every network interruption is recoverable. Host migration and automatic room recovery remain unsupported.

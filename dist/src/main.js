@@ -114,6 +114,7 @@ function boot() {
     if (!net) return;
     $('net-status').textContent =
       message ||
+      net.lastError ||
       (!net.connected
         ? 'Solo'
         : `${net.host ? 'Hosting' : 'Joined'} · ${net.players.size + 1}/4 players${net.ping ? ' · ' + net.ping + ' ms' : ''}`);
@@ -417,14 +418,17 @@ function boot() {
     if (player.mode !== 'creative') return ui.toast('Choose Creative in World options to fly.');
     player.toggleFlight();
     ui.toast(
-      player.flying ? 'Flying · Space up · Ctrl down · Shift fast' : 'Flight off · G to fly again',
+      player.flying
+        ? 'Flying · Space up · Ctrl down · Shift fast'
+        : 'Flight off · G to fly again',
     );
   }
   $('touch-flight').onclick = flight;
   $('game-mode').onchange = (e) => {
     player.setMode(e.target.value);
     $('world-subtitle').textContent =
-      (player.mode === 'creative' ? 'Creative flight' : 'Survival sandbox') + ' · Infinite terrain';
+      (player.mode === 'creative' ? 'Creative flight' : 'Survival sandbox') +
+      ' · Infinite terrain';
     ui.toast(
       player.mode === 'creative'
         ? 'Creative mode · You can fly.'
@@ -479,7 +483,8 @@ function boot() {
     $('seed-label').textContent = world.seed;
     $('play').disabled = true;
     $('play-label').textContent = 'Growing your world…';
-    $('load-status').textContent = 'Shaping ' + PRESETS[world.options.preset].name.toLowerCase();
+    $('load-status').textContent =
+      'Shaping ' + PRESETS[world.options.preset].name.toLowerCase();
     $('travel').querySelector('h2').textContent = 'Growing a new world…';
     $('travel').classList.remove('hidden');
     renderer.target.visible = false;
@@ -502,7 +507,8 @@ function boot() {
     player.life++;
     player.health = 20;
     player.hurtTime = 2;
-    if (world.dimension !== 'overworld' && !net.guest) travel('overworld', spawn.x, spawn.z, true);
+    if (world.dimension !== 'overworld' && !net.guest)
+      travel('overworld', spawn.x, spawn.z, true);
     else player.teleport(spawn.x, spawn.y, spawn.z);
   }
   function openCompanion() {
@@ -513,7 +519,8 @@ function boot() {
   }
   for (const button of document.querySelectorAll('[data-command]'))
     button.onclick = () => {
-      if (net.guest) net.request('companion', { command: button.dataset.command, block: ui.block });
+      if (net.guest)
+        net.request('companion', { command: button.dataset.command, block: ui.block });
       else companion.command(button.dataset.command, target, ui.block);
       resume();
     };
@@ -646,7 +653,9 @@ function boot() {
     )
       return ui.toast('Step back a little to place that block.');
     if (
-      entities.pool.some((e) => e.active && overlapsBlock(e.position, x, y, z, e.width, e.height))
+      entities.pool.some(
+        (e) => e.active && overlapsBlock(e.position, x, y, z, e.width, e.height),
+      )
     )
       return;
     net.animate('place');
@@ -808,26 +817,32 @@ function boot() {
       portals.cooldown = 4;
       $('travel').classList.add('hidden');
       ui.toast(
-        t.d === 'nether' ? 'The Nether. Watch your step around lava.' : 'Back in the Overworld.',
+        t.d === 'nether'
+          ? 'The Nether. Watch your step around lava.'
+          : 'Back in the Overworld.',
       );
     }
-    if (started && !paused && ready && !net.waiting && player.health > 0) {
+    const localRunning = started && !paused && ready && !net.waiting && player.health > 0;
+    const sharedRunning = net.simulates(ready && (started || net.host), paused);
+    if (localRunning || sharedRunning) {
       accumulator += dt;
       while (accumulator >= 1 / 60) {
-        player.tick(world, keys, 1 / 60);
-        if (!net.guest) {
+        if (localRunning) player.tick(world, keys, 1 / 60);
+        if (sharedRunning) {
           companion.tick(1 / 60);
           entities.tick(player, 1 / 60, daylight, net.actors());
           fluids.tick(1 / 60);
           lava.tick(1 / 60);
           tnt.tick(1 / 60);
         }
-        portals.tick(1 / 60);
+        if (localRunning) portals.tick(1 / 60);
         accumulator -= 1 / 60;
         tickCount++;
         if (travelPending) break;
       }
-      if (!net.guest) tnt.flush();
+      if (sharedRunning) tnt.flush();
+    } else accumulator = 0;
+    if (localRunning) {
       const alpha = accumulator / (1 / 60);
       const desiredY =
         THREE.MathUtils.lerp(player.previous.y, player.position.y, alpha) + EYE_HEIGHT;
@@ -851,8 +866,10 @@ function boot() {
       const desiredFov =
         73 +
         (player.flying
-          ? Math.min(1, Math.hypot(player.velocity.x, player.velocity.y, player.velocity.z) / 24) *
-            4
+          ? Math.min(
+              1,
+              Math.hypot(player.velocity.x, player.velocity.y, player.velocity.z) / 24,
+            ) * 4
           : 0);
       if (Math.abs(renderer.camera.fov - desiredFov) > 0.01) {
         renderer.camera.fov += (desiredFov - renderer.camera.fov) * (1 - Math.exp(-6 * dt));
@@ -861,7 +878,6 @@ function boot() {
       updateTarget();
       actions(dt);
     } else {
-      accumulator = 0;
       if (!started) {
         const p = player.position;
         renderer.camera.position.set(
@@ -879,7 +895,7 @@ function boot() {
     if (net.guest) tnt.replicaTick(dt);
     const renderAlpha = net.guest
       ? net.replicaAlpha()
-      : started && !paused && ready
+      : localRunning || sharedRunning
         ? accumulator * 60
         : 1;
     entities.draw(time, player, renderAlpha);
@@ -889,7 +905,7 @@ function boot() {
       renderer.camera.rotation.x += Math.sin(time * 73) * tnt.shake * 0.014;
       renderer.camera.rotation.z = Math.sin(time * 57) * tnt.shake * 0.009;
     }
-    weather.update(dt, time, renderer.camera.position, !net.guest && started && !paused && ready);
+    weather.update(dt, time, renderer.camera.position, sharedRunning);
     ui.health(player.health, player.mode === 'creative');
     if (player.health <= 0 && !deathShown) {
       deathShown = true;
@@ -919,7 +935,8 @@ function boot() {
       $('coordinates').textContent =
         `${(p.x * BLOCK_SIZE).toFixed(1)} / ${(p.y * BLOCK_SIZE).toFixed(1)} / ${(p.z * BLOCK_SIZE).toFixed(1)} m`;
       const cardinal = ['N', 'NW', 'W', 'SW', 'S', 'SE', 'E', 'NE'];
-      $('heading').textContent = cardinal[((Math.round(player.yaw / (Math.PI / 4)) % 8) + 8) % 8];
+      $('heading').textContent =
+        cardinal[((Math.round(player.yaw / (Math.PI / 4)) % 8) + 8) % 8];
     }
     statTime += dt;
     if (statTime >= 1) {
@@ -948,7 +965,10 @@ function boot() {
       const wall = raycast(world.get.bind(world), anchor, offset, length, solid);
       renderer.camera.position
         .copy(anchor)
-        .addScaledVector(offset, Math.max(0.2, Math.min(length, (wall?.distance ?? length) - 0.2)));
+        .addScaledVector(
+          offset,
+          Math.max(0.2, Math.min(length, (wall?.distance ?? length) - 0.2)),
+        );
       renderer.camera.lookAt(anchor);
     }
     firstPerson.update(
@@ -973,7 +993,7 @@ function boot() {
       drawCalls: renderer.gl.info.render.calls,
       triangles: renderer.gl.info.render.triangles,
     }),
-    version: '1.8.0',
+    version: '1.8.2',
   };
 }
 try {

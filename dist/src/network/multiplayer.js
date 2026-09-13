@@ -1,4 +1,5 @@
 import { Ragdolls } from '../ragdolls.js';
+import { RemotePoseBuffer } from './interpolation.js';
 import { startAction, playerSkin } from '../character-motion.js';
 import { characterParts } from '../character-models.js';
 import { THREE } from '../renderer.js';
@@ -139,7 +140,8 @@ export class Multiplayer {
     this.epoch = world.epoch;
     this.seq = 0;
     this.netTime = null;
-    this.labels = typeof document !== 'undefined' ? document.getElementById('remote-labels') : null;
+    this.labels =
+      typeof document !== 'undefined' ? document.getElementById('remote-labels') : null;
     const originalSet = world.set.bind(world);
     this.originalSet = originalSet;
     world.set = (x, y, z, b, record = true, persist = record) => {
@@ -211,7 +213,9 @@ export class Multiplayer {
     return this.role !== 'solo';
   }
   actors() {
-    return [...this.players.values()].map((p) => p.actor).filter((a) => a?.active && a.health > 0);
+    return [...this.players.values()]
+      .map((p) => p.actor)
+      .filter((a) => a?.active && a.health > 0);
   }
   allTargets(actor) {
     return {
@@ -235,7 +239,21 @@ export class Multiplayer {
     };
   }
   status(message) {
-    this.onStatus?.(message || '');
+    this.onStatus?.(message || this.lastError || '');
+  }
+  fail(message) {
+    console.warn('[Voxel multiplayer]', message);
+    this.notify(message);
+    this.disconnect(true, message);
+  }
+  // Opening a menu or dying must not pause a world other people are playing.
+  simulates(ready, paused) {
+    return (
+      ready &&
+      !this.waiting &&
+      !this.guest &&
+      (this.host || (!paused && this.player.health > 0))
+    );
   }
   connect(address, name, room) {
     if (this.connected || this.socket) throw Error('Leave the current connection first.');
@@ -248,14 +266,16 @@ export class Multiplayer {
     if (edits?.length > MAX_EDITS)
       throw Error('This world has too many edits for a room. Start a smaller world first.');
     this.address = url;
+    this.lastError = '';
     this.intent = room ? 'join' : 'create';
     this.waiting = !!room;
     const ws = (this.socket = new WebSocket(url));
     this.status('Connecting…');
     const timeout = setTimeout(() => {
       if (this.socket === ws && this.role === 'solo') {
-        this.notify('Server did not respond. Start npm run server, then check the server address.');
-        this.disconnect();
+        this.fail(
+          'Server did not respond. Start npm run server, then check the server address.',
+        );
       }
     }, 12000);
     ws.onopen = () =>
@@ -273,29 +293,38 @@ export class Multiplayer {
       try {
         this.receive(JSON.parse(event.data));
       } catch (e) {
-        this.notify('Multiplayer sync failed: ' + e.message);
-        this.disconnect();
+        this.fail('Multiplayer sync failed: ' + e.message);
       }
     };
     ws.onerror = () => {
       if (this.socket === ws)
         this.status('Cannot reach server. Check its address and that it is running.');
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       clearTimeout(timeout);
       if (this.socket === ws) {
         this.socket = null;
-        this.disconnect(false);
-        this.notify('Disconnected. You can continue this world in solo.');
+        const detail =
+          event.reason ||
+          (event.code === 1006
+            ? 'Connection lost without a close reason. Check the server and tunnel terminals.'
+            : 'The server closed the connection.');
+        const message = `Disconnected (${event.code}): ${detail} Current world retained in solo.`;
+        console.warn('[Voxel multiplayer]', message);
+        this.disconnect(false, message);
+        this.notify(message);
       }
     };
     this.connectTimer = timeout;
   }
-  send(m) {
+  send(m, defer = false) {
     if (this.socket?.readyState !== WebSocket.OPEN) return false;
-    if (this.socket.bufferedAmount > 4 * 1024 * 1024) {
-      this.notify('Connection is too slow. Continuing in solo.');
-      this.disconnect();
+    // Latest poses can wait; edit/effect queues retain their unsent contents.
+    if (defer && this.socket.bufferedAmount > 256 * 1024) return false;
+    if (this.socket.bufferedAmount > 16 * 1024 * 1024) {
+      this.fail(
+        'Upload backlog exceeded 16 MB. Check the connection; current world retained in solo.',
+      );
       return false;
     }
     this.socket.send(JSON.stringify(m));
@@ -305,7 +334,7 @@ export class Multiplayer {
     if (this.waiting) return this.notify('Wait for the host to finish loading.');
     this.send({ type: 'action', epoch: this.epoch, action, data, state: pose(this.player) });
   }
-  disconnect(close = true) {
+  disconnect(close = true, reason = '') {
     clearTimeout(this.connectTimer);
     const ws = this.socket;
     this.socket = null;
@@ -314,6 +343,7 @@ export class Multiplayer {
       ws.close();
     }
     this.role = 'solo';
+    this.lastError = reason;
     this.room = '';
     this.waiting = false;
     this.pending.clear();
@@ -325,18 +355,18 @@ export class Multiplayer {
     for (const p of this.players.values()) p.label?.remove();
     this.players.clear();
     this.companion.player = this.player;
-    this.status('Solo · current world retained');
+    this.status(reason || 'Solo · current world retained');
   }
   receive(m) {
     if (m.type === 'error') {
+      console.warn('[Voxel multiplayer] Server rejected an update:', m.message);
       this.notify(m.message);
       this.status(m.message);
-      if (m.fatal || !this.connected) this.disconnect();
+      if (m.fatal || !this.connected) this.disconnect(true, m.message);
       return;
     }
     if (m.type === 'closed') {
-      this.notify(m.reason);
-      this.disconnect();
+      this.fail(m.reason);
       return;
     }
     if (m.type === 'welcome' || m.type === 'reset') {
@@ -361,6 +391,7 @@ export class Multiplayer {
         this.companion.entity = null;
       }
       this.pending.clear();
+      for (const p of this.players.values()) p.motion.reset();
       this.roster(m.players);
       if (m.frame) this.receive(m.frame);
       this.status(`${this.host ? 'Hosting' : 'Joined'} · ${m.players.length}/4 players`);
@@ -486,7 +517,14 @@ export class Multiplayer {
         actor.life = -1;
         actor.deadLife = null;
         actor.active = false;
-        const entry = { name: p.name, actor, target: null, label: null };
+        const entry = {
+          name: p.name,
+          actor,
+          target: null,
+          label: null,
+          motion: new RemotePoseBuffer(),
+          rendered: {},
+        };
         if (this.labels) {
           entry.label = document.createElement('span');
           entry.label.className = 'remote-name';
@@ -494,7 +532,12 @@ export class Multiplayer {
           this.labels.append(entry.label);
         }
         actor.damage = (amount, dx, dz) => {
-          if (!this.host || actor.mode === 'creative' || actor.hurtTime > 0 || actor.health <= 0)
+          if (
+            !this.host ||
+            actor.mode === 'creative' ||
+            actor.hurtTime > 0 ||
+            actor.health <= 0
+          )
             return;
           actor.health = Math.max(0, actor.health - amount);
           actor.hurtTime = 0.7;
@@ -555,6 +598,7 @@ export class Multiplayer {
     Object.assign(actor.previous, actor.position);
     Object.assign(actor.position, s.position);
     p.at = performance.now();
+    p.motion.push(s, p.at);
     actor.heading = s.yaw + Math.PI;
     if (actor.health <= 0) this.killRemote(actor);
   }
@@ -568,7 +612,7 @@ export class Multiplayer {
     return Math.min(1, (performance.now() - this.frameAt) / 100);
   }
   update(dt, { ready, paused, time }) {
-    this.ragdollsPaused = paused && this.player.health > 0;
+    this.ragdollsPaused = !this.host && paused && this.player.health > 0;
     this.ragdolls.update(dt, ready && !this.guest && !this.ragdollsPaused);
     for (const p of this.players.values()) {
       p.actor.hurtTime = Math.max(0, (p.actor.hurtTime || 0) - dt);
@@ -580,6 +624,7 @@ export class Multiplayer {
       this.epoch = this.world.epoch;
       this.pending.clear();
       this.effects = [];
+      for (const p of this.players.values()) p.motion.reset();
       this.send({ type: 'reset', world: this.exportWorld(), edits: worldEdits(this.world) });
     }
     this.timer += dt;
@@ -587,69 +632,95 @@ export class Multiplayer {
     this.pingTimer += dt;
     if (this.timer >= 0.05) {
       this.timer = 0;
-      if (ready && !this.waiting) this.send({ type: 'position', state: pose(this.player) });
+      if (ready && !this.waiting)
+        this.send({ type: 'position', state: pose(this.player) }, true);
       if (this.host && this.world.epoch === this.epoch) {
-        const rows = [...this.pending.values()];
-        for (let i = 0; i < rows.length; i += 2048)
-          this.send({ type: 'edits', epoch: this.epoch, edits: rows.slice(i, i + 2048) });
-        this.pending.clear();
-        for (const e of this.effects) this.send({ ...e, epoch: this.epoch });
-        this.effects = [];
+        const rows = [];
+        for (const row of this.pending.values()) {
+          rows.push(row);
+          if (rows.length === 2048) break;
+        }
+        if (rows.length && this.send({ type: 'edits', epoch: this.epoch, edits: rows }, true))
+          for (const row of rows) this.pending.delete(editKey(row));
+        for (let i = 0; i < 8 && this.effects.length; i++) {
+          if (!this.send({ ...this.effects[0], epoch: this.epoch }, true)) break;
+          this.effects.shift();
+        }
       }
     }
     if (this.host && ready && this.frameTimer >= 0.1) {
       this.frameTimer = 0;
-      this.send({
-        type: 'frame',
-        epoch: this.epoch,
-        mobs: this.entities.pool.filter((e) => e.active).map(mobState),
-        bombs: this.tnt.pool.filter((b) => b.active).map(bombState),
-        ragdolls: this.ragdolls.snapshot(),
-        paused,
-        time,
-        weather: this.weather.mode,
-        pip: { mode: this.companion.mode },
-      });
+      this.send(
+        {
+          type: 'frame',
+          epoch: this.epoch,
+          mobs: this.entities.pool.filter((e) => e.active).map(mobState),
+          bombs: this.tnt.pool.filter((b) => b.active).map(bombState),
+          ragdolls: this.ragdolls.snapshot(),
+          paused: !this.simulates(ready, paused),
+          time,
+          weather: this.weather.mode,
+          pip: { mode: this.companion.mode },
+        },
+        true,
+      );
     }
     if (this.pingTimer >= 2) {
       this.pingTimer = 0;
       this.send({ type: 'ping', sent: performance.now() });
     }
   }
-  drawPlayers(time) {
+  drawPlayers(time, now = performance.now()) {
     this.ragdolls.draw(this.guest, this.ragdollsPaused);
     const saved = [];
-    const now = performance.now();
     for (const p of this.players.values()) {
       const e = p.actor;
       if (!e.active) {
         if (p.label) p.label.hidden = true;
         continue;
       }
-      const alpha = Math.min(1, (now - p.at) / 50);
-      saved.push([e, { ...e.position }]);
-      for (const a of ['x', 'y', 'z'])
-        e.position[a] = THREE.MathUtils.lerp(e.previous[a], e.position[a], alpha);
+      saved.push([e, { ...e.position }, e.yaw, e.pitch, e.heading]);
+      if (p.motion.sample(now, p.rendered)) {
+        for (const a of ['x', 'y', 'z']) e.position[a] = p.rendered[a];
+        e.yaw = p.rendered.yaw;
+        e.heading = e.yaw + Math.PI;
+        e.pitch = p.rendered.pitch;
+      }
       if (p.label) {
         const pos = new THREE.Vector3(e.position.x, e.position.y + 2.15, e.position.z),
           dist = pos.distanceTo(this.renderer.camera.position);
         pos.project(this.renderer.camera);
         const show =
-          dist < 60 && pos.z > -1 && pos.z < 1 && Math.abs(pos.x) < 1.1 && Math.abs(pos.y) < 1.1;
+          dist < 60 &&
+          pos.z > -1 &&
+          pos.z < 1 &&
+          Math.abs(pos.x) < 1.1 &&
+          Math.abs(pos.y) < 1.1;
         p.label.hidden = !show;
         if (show)
           p.label.style.transform = `translate(${(pos.x * 0.5 + 0.5) * innerWidth}px,${(-pos.y * 0.5 + 0.5) * innerHeight}px) translate(-50%,-100%)`;
       }
     }
-    this.remote.draw(time, null, 1);
-    for (const [e, pos] of saved) Object.assign(e.position, pos);
+    // Combat, building reach, damage and AI always see the latest network pose.
+    try {
+      this.remote.draw(time, null, 1);
+    } finally {
+      for (const [e, pos, yaw, pitch, heading] of saved) {
+        Object.assign(e.position, pos);
+        Object.assign(e, { yaw, pitch, heading });
+      }
+    }
   }
   beginTransition() {
     if (this.host) this.send({ type: 'loading' });
   }
   aim(actor) {
     const c = Math.cos(actor.pitch),
-      dir = { x: -Math.sin(actor.yaw) * c, y: Math.sin(actor.pitch), z: -Math.cos(actor.yaw) * c };
+      dir = {
+        x: -Math.sin(actor.yaw) * c,
+        y: Math.sin(actor.pitch),
+        z: -Math.cos(actor.yaw) * c,
+      };
     // Three's positive camera X rotation looks upwards.
     const origin = { x: actor.position.x, y: actor.position.y + 1.62, z: actor.position.z };
     return {
@@ -697,7 +768,11 @@ export class Multiplayer {
     const reply = (message) => this.send({ type: 'notice', epoch: this.epoch, id, message });
     if (action === 'edit') {
       const { x, y, z, b } = data;
-      if (!validEdit([dimensionId(world.dimension), x, y, z, b]) || !target || !world.loaded(x, z))
+      if (
+        !validEdit([dimensionId(world.dimension), x, y, z, b]) ||
+        !target ||
+        !world.loaded(x, z)
+      )
         return;
       if (b === B.AIR) {
         if (target.x !== x || target.y !== y || target.z !== z || target.block === B.BEDROCK)
@@ -707,8 +782,8 @@ export class Multiplayer {
         y !== target.y + target.normal.y ||
         z !== target.z + target.normal.z ||
         solid(world.get(x, y, z)) ||
-        [this.player, ...this.actors(), ...this.entities.pool.filter((e) => e.active)].some((e) =>
-          overlapsBlock(e.position, x, y, z, e.width, e.height),
+        [this.player, ...this.actors(), ...this.entities.pool.filter((e) => e.active)].some(
+          (e) => overlapsBlock(e.position, x, y, z, e.width, e.height),
         )
       )
         return;
